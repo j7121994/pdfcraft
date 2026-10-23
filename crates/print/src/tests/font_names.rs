@@ -209,6 +209,77 @@ fn programs_past_the_shared_decode_budget_keep_their_names() {
     assert_eq!(true_type_fonts(&distinct(&pdf).unwrap().unwrap()).iter().filter(|f| f.0.contains("PdfCraftPrint")).count(), 2);
 }
 
+/// A CIDFontType2 named `base_font` over `program`, written as a dictionary with its descriptor
+/// inline, as some producers put it straight into `/DescendantFonts`.
+fn inline_cid_font(base_font: &str, program: ObjRef) -> Dict {
+    let mut descriptor = Dict::new();
+    descriptor.set(b"Type".to_vec(), Object::name("FontDescriptor"));
+    descriptor.set(b"FontName".to_vec(), Object::name(base_font));
+    descriptor.set(b"FontFile2".to_vec(), Object::Ref(program));
+    let mut cid = Dict::new();
+    cid.set(b"Type".to_vec(), Object::name("Font"));
+    cid.set(b"Subtype".to_vec(), Object::name("CIDFontType2"));
+    cid.set(b"BaseFont".to_vec(), Object::name(base_font));
+    cid.set(b"FontDescriptor".to_vec(), Object::Dict(descriptor));
+    cid
+}
+
+fn type0_font(doc: &mut Document, base_font: &str, descendants: Object) -> ObjRef {
+    let mut type0 = Dict::new();
+    type0.set(b"Type".to_vec(), Object::name("Font"));
+    type0.set(b"Subtype".to_vec(), Object::name("Type0"));
+    type0.set(b"BaseFont".to_vec(), Object::name(base_font));
+    type0.set(b"Encoding".to_vec(), Object::name("Identity-H"));
+    type0.set(b"DescendantFonts".to_vec(), descendants);
+    doc.add(Object::Dict(type0))
+}
+
+#[test]
+fn a_cidfont_written_inside_its_type0_font_is_renamed_with_it() {
+    let mut doc = fixture(1);
+    let (shared, own) = (program_stream(&mut doc), program_stream(&mut doc));
+    let simple = true_type_font(&mut doc, "AAAAAA+ArialMT", shared);
+    // In `/DescendantFonts` itself, sharing the simple font's program; and in an array object of
+    // its own, over a program nothing else uses.
+    let direct = type0_font(&mut doc, "BAAAAA+ArialMT-Identity-H", Object::Array(vec![Object::Dict(inline_cid_font("BAAAAA+ArialMT", shared))]));
+    let array = doc.add(Object::Array(vec![Object::Dict(inline_cid_font("CAAAAA+ArialMT", own))]));
+    let in_array = type0_font(&mut doc, "CAAAAA+ArialMT-Identity-H", Object::Ref(array));
+    let mut fonts = Dict::new();
+    for (key, font) in [(b"F1", simple), (b"F2", direct), (b"F3", in_array)] {
+        fonts.set(key.to_vec(), Object::Ref(font));
+    }
+    let mut resources = Dict::new();
+    resources.set(b"Font".to_vec(), Object::Dict(fonts));
+    let page = pdfcraft_model::pages(&doc)[0].obj;
+    doc.update_dict(page, |d| d.set(b"Resources".to_vec(), Object::Dict(resources))).unwrap();
+    let pdf = write_full(&doc, &SaveOptions::default()).unwrap();
+
+    let renamed = Document::open(Arc::new(distinct(&pdf).unwrap().unwrap())).unwrap();
+    let page = renamed.dict(&Object::Ref(pdfcraft_model::pages(&renamed)[0].obj)).unwrap();
+    let fonts = renamed.dict(renamed.dict(page.get(b"Resources").unwrap()).unwrap().get(b"Font").unwrap()).unwrap();
+    let name = |d: &Dict, key: &[u8]| String::from_utf8(d.name(key).unwrap().to_vec()).unwrap();
+    let simple = renamed.dict(fonts.get(b"F1").unwrap()).unwrap();
+    for (key, tag) in [(b"F2", "BAAAAA+"), (b"F3", "CAAAAA+")] {
+        let type0 = renamed.dict(fonts.get(key).unwrap()).unwrap();
+        let descendants = renamed.resolve(type0.get(b"DescendantFonts").unwrap());
+        let Some(Object::Dict(cid)) = descendants.as_array().and_then(|a| a.first()) else { panic!("inline CIDFont") };
+        let Some(Object::Dict(descriptor)) = cid.get(b"FontDescriptor") else { panic!("inline descriptor") };
+        let program = renamed.resolve(descriptor.get(b"FontFile2").unwrap());
+        let Object::Stream(program) = program.as_ref() else { panic!("program") };
+        let family = name_of(&program.decoded().unwrap(), StringId::FAMILY_NAME).unwrap();
+        // The Type 0 font, its CIDFont and the descriptor all say the program's new name.
+        let expected = format!("{tag}{family}");
+        assert!(family.starts_with("PdfCraftPrint"), "{family}");
+        assert_eq!(
+            (name(&type0, b"BaseFont"), name(cid, b"BaseFont"), name(descriptor, b"FontName")),
+            (expected.clone(), expected.clone(), expected)
+        );
+    }
+    // The shared program has one name, whichever font led to it.
+    let shared_name = name(&simple, b"BaseFont").replace("AAAAAA+", "");
+    assert_eq!(name(&renamed.dict(fonts.get(b"F2").unwrap()).unwrap(), b"BaseFont"), format!("BAAAAA+{shared_name}"));
+}
+
 #[test]
 fn fonts_sharing_a_program_share_its_name_and_type0_fonts_follow_their_cidfont() {
     let mut doc = fixture(1);

@@ -59,6 +59,29 @@ struct Found {
     fonts: BTreeMap<ObjRef, ObjRef>,
     /// Indirect font descriptors, with their program.
     descriptors: BTreeMap<ObjRef, ObjRef>,
+    /// Type 0 fonts whose CIDFont is an object of its own, with that CIDFont.
+    type0: BTreeMap<ObjRef, ObjRef>,
+    /// Type 0 fonts whose CIDFont is written inline, with the array object holding it when
+    /// `/DescendantFonts` names one, and the CIDFont's program.
+    inline: BTreeMap<ObjRef, (Option<ObjRef>, ObjRef)>,
+}
+
+impl Found {
+    /// Note the program `font` draws with, and its descriptor when that is an object of its own;
+    /// the program, if it has one to rename.
+    fn add(&mut self, doc: &Document, font: &Dict) -> Option<ObjRef> {
+        if !font.name(b"Subtype").is_some_and(|s| DRAWN_WITH_A_PROGRAM.contains(&s)) {
+            return None;
+        }
+        let descriptor = font.get(b"FontDescriptor")?;
+        let (program, true_type) = doc.dict(descriptor).and_then(|d| program(doc, &d))?;
+        let number = self.programs.len() + 1;
+        self.programs.entry(program).or_insert_with(|| Program { name: format!("PdfCraftPrint{number}"), true_type });
+        if let Object::Ref(descriptor) = descriptor {
+            self.descriptors.insert(*descriptor, program);
+        }
+        Some(program)
+    }
 }
 
 /// `pdf` with every embedded TrueType or OpenType program renamed; `None` when it has none that
@@ -84,17 +107,27 @@ pub(crate) fn distinct_within(pdf: &[u8], budget: &mut DecodeBudget) -> Result<O
     }
     for (font, program) in &found.fonts {
         let Some(about) = found.programs.get(program) else { continue };
-        doc.update_dict(*font, |d| {
-            rename(d, b"BaseFont", &about.name);
-            if let Some(Object::Dict(descriptor)) = d.get_mut(b"FontDescriptor") {
-                rename(descriptor, b"FontName", &about.name);
-            }
-        })?;
+        doc.update_dict(*font, |d| rename_font(d, &about.name))?;
     }
     // A Type 0 font is named after its CIDFont; renaming only the CIDFont would leave the old
     // name on the font the page uses.
-    for (font, name) in type0_names(&doc, &found) {
-        doc.update_dict(font, |d| rename(d, b"BaseFont", &name))?;
+    for (font, cid) in &found.type0 {
+        let Some(about) = found.fonts.get(cid).and_then(|p| found.programs.get(p)) else { continue };
+        doc.update_dict(*font, |d| rename(d, b"BaseFont", &about.name))?;
+    }
+    for (font, (array, program)) in &found.inline {
+        let Some(about) = found.programs.get(program) else { continue };
+        doc.update_dict(*font, |d| {
+            rename(d, b"BaseFont", &about.name);
+            if let Some(Object::Array(descendants)) = d.get_mut(b"DescendantFonts") {
+                rename_first(descendants, &about.name);
+            }
+        })?;
+        if let Some(array) = array {
+            let Object::Array(mut descendants) = doc.get(*array).as_ref().clone() else { continue };
+            rename_first(&mut descendants, &about.name);
+            doc.set(*array, Object::Array(descendants));
+        }
     }
     Ok(Some(write_full(&doc, &SaveOptions::default())?))
 }
@@ -103,19 +136,50 @@ fn find(doc: &Document) -> Found {
     let mut found = Found::default();
     for (reference, object) in doc.scan_objects() {
         let Object::Dict(font) = object.as_ref() else { continue };
-        if !font.name(b"Subtype").is_some_and(|s| DRAWN_WITH_A_PROGRAM.contains(&s)) {
-            continue;
-        }
-        let Some(descriptor) = font.get(b"FontDescriptor") else { continue };
-        let Some(program) = doc.dict(descriptor).and_then(|d| program(doc, &d)) else { continue };
-        let number = found.programs.len() + 1;
-        found.programs.entry(program.0).or_insert_with(|| Program { name: format!("PdfCraftPrint{number}"), true_type: program.1 });
-        found.fonts.insert(reference, program.0);
-        if let Object::Ref(descriptor) = descriptor {
-            found.descriptors.insert(*descriptor, program.0);
+        if font.name(b"Subtype") == Some(b"Type0") {
+            find_descendant(doc, reference, font, &mut found);
+        } else if let Some(program) = found.add(doc, font) {
+            found.fonts.insert(reference, program);
         }
     }
     found
+}
+
+/// Note the CIDFont a Type 0 font is named after: an object of its own, renamed when the scan
+/// reaches it, or written inline, which no scan reaches, so its program is noted here.
+fn find_descendant(doc: &Document, font: ObjRef, d: &Dict, found: &mut Found) {
+    let Some(descendants) = d.get(b"DescendantFonts") else { return };
+    let array = match descendants {
+        Object::Ref(array) => Some(*array),
+        _ => None,
+    };
+    let descendants = doc.resolve(descendants);
+    match descendants.as_array().and_then(|a| a.first()) {
+        Some(Object::Ref(cid)) => {
+            found.type0.insert(font, *cid);
+        }
+        Some(Object::Dict(cid)) => {
+            if let Some(program) = found.add(doc, cid) {
+                found.inline.insert(font, (array, program));
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Rename a simple font or CIDFont, and its descriptor when that is written inline.
+fn rename_font(d: &mut Dict, name: &str) {
+    rename(d, b"BaseFont", name);
+    if let Some(Object::Dict(descriptor)) = d.get_mut(b"FontDescriptor") {
+        rename(descriptor, b"FontName", name);
+    }
+}
+
+/// Rename the CIDFont written inline at the head of `/DescendantFonts`.
+fn rename_first(descendants: &mut [Object], name: &str) {
+    if let Some(Object::Dict(cid)) = descendants.first_mut() {
+        rename_font(cid, name);
+    }
 }
 
 /// The descriptor's TrueType program (`/FontFile2`), else its OpenType one (`/FontFile3` with
@@ -127,24 +191,6 @@ fn program(doc: &Document, descriptor: &Dict) -> Option<(ObjRef, bool)> {
     let Some(Object::Ref(program)) = descriptor.get(b"FontFile3") else { return None };
     let open_type = matches!(doc.get(*program).as_ref(), Object::Stream(s) if s.dict.name(b"Subtype") == Some(b"OpenType"));
     open_type.then_some((*program, false))
-}
-
-/// The Type 0 fonts whose CIDFont was renamed, with the new name.
-fn type0_names(doc: &Document, found: &Found) -> Vec<(ObjRef, String)> {
-    let mut names = Vec::new();
-    for (reference, object) in doc.scan_objects() {
-        let Object::Dict(font) = object.as_ref() else { continue };
-        if font.name(b"Subtype") != Some(b"Type0") {
-            continue;
-        }
-        let descendants = font.get(b"DescendantFonts").map(|d| doc.resolve(d));
-        let Some(Object::Ref(descendant)) = descendants.as_deref().and_then(Object::as_array).and_then(|a| a.first()) else { continue };
-        let program = found.fonts.get(descendant).and_then(|p| found.programs.get(p));
-        if let Some(program) = program {
-            names.push((reference, program.name.clone()));
-        }
-    }
-    names
 }
 
 /// Set `key` to `name`, keeping the subset tag the old name had.
