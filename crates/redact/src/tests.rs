@@ -1690,8 +1690,8 @@ fn bluefin_survives(doc: &Document) -> bool {
 
 /// #3285 review (the maintainer's probes): an element written in place in the parent tree that
 /// owns the redacted text can't be changed, so applying is refused; the same element as an object
-/// of its own is cleaned, and nothing of the word is left in a full rewrite.
-/// Refusal does not promise rollback: direct callers discard the failed working copy.
+/// of its own is cleaned, and nothing of the word is left in a full rewrite. A refusal leaves the
+/// document as it was.
 #[test]
 fn an_element_written_in_place_owning_redacted_text_is_refused() {
     let objs = |element: &str| -> Vec<Vec<u8>> {
@@ -1711,17 +1711,13 @@ fn an_element_written_in_place_owning_redacted_text_is_refused() {
     let mut doc = pdf(objs("<< /Type /StructElem /S /P /P 6 0 R /Pg 3 0 R /K 0 /ActualText (Codename Bluefin) >>"));
     mark(&mut doc, 0, &[[10.0, 140.0, 290.0, 170.0]], "");
     let before = write_full(&doc, &SaveOptions::default()).unwrap();
-    let mut working = doc.clone();
-    let error = apply(&mut working, None).unwrap_err();
+    let error = apply(&mut doc, None).unwrap_err();
     assert!(matches!(error, RedactError::Tags));
     assert_eq!(
         error.to_string(),
         "the document's tags can't be cleaned completely (an element written in place, or a structure tree too large or too deep to follow); the operation was refused"
     );
-    assert!(!content(&working, 0).contains("Bluefin"), "the failed working copy was partially changed");
-    assert!(bluefin_survives(&working), "the failed working copy still holds the word in its tags");
-    drop(working);
-    assert_eq!(write_full(&doc, &SaveOptions::default()).unwrap(), before, "discarding the working copy preserves the original");
+    assert_eq!(write_full(&doc, &SaveOptions::default()).unwrap(), before, "the refused document is unchanged");
     let mut doc = pdf(objs("7 0 R"));
     mark(&mut doc, 0, &[[10.0, 140.0, 290.0, 170.0]], "");
     let r = apply(&mut doc, None).unwrap();
@@ -2744,4 +2740,107 @@ fn content_and_forms_share_one_budget_per_page() {
     .unwrap();
     mark(&mut doc, 0, &[[0.0, 90.0, 50.0, 120.0]], "");
     assert!(apply(&mut doc, None).is_err(), "the form past the page's allowance was read");
+}
+
+/// A page that fails to read after another page was already redacted leaves the whole document as
+/// it was, the shared resources the first page's rewrite localised included.
+#[test]
+fn a_failure_on_a_later_page_leaves_the_document_unchanged() {
+    let mut doc = two_pages_one_resource_dictionary(true, false);
+    let all = pdfcraft_model::pages(&doc);
+    let (first, second, parent) = (all[0].obj, all[1].obj, doc.get(all[0].obj).as_dict().unwrap().reference(b"Parent").unwrap());
+    let mut dct = Dict::new();
+    dct.set(b"Filter".to_vec(), Object::name("DCTDecode"));
+    let bad = doc.add(Object::Stream(Stream::from_raw(dct, b"garbage".to_vec())));
+    doc.update_dict(second, |d| d.set(b"Contents".to_vec(), Object::Ref(bad))).unwrap();
+    mark(&mut doc, 0, &[[0.0, 0.0, 300.0, 300.0]], "");
+    mark(&mut doc, 1, &[[0.0, 0.0, 50.0, 50.0]], "");
+    let before: Vec<Object> = [first, second, parent].iter().map(|r| (*doc.get(*r)).clone()).collect();
+    let text = content(&doc, 0);
+    assert_eq!(apply(&mut doc, None), Err(RedactError::Unreadable(2)));
+    let after: Vec<Object> = [first, second, parent].iter().map(|r| (*doc.get(*r)).clone()).collect();
+    assert_eq!(after, before);
+    assert_eq!(content(&doc, 0), text);
+}
+
+#[test]
+fn a_reply_and_pop_up_on_another_page_go_with_the_removed_comment() {
+    let objs: Vec<Vec<u8>> = vec![
+        b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+        b"<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>".to_vec(),
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 300] /Contents 5 0 R /Annots [6 0 R] >>".to_vec(),
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 300] /Contents 5 0 R /Annots [7 0 R 8 0 R] >>".to_vec(),
+        stream("", b"BT ET"),
+        b"<< /Type /Annot /Subtype /Text /Rect [20 20 40 40] /Contents (PARENT-NOTE) /Popup 8 0 R >>".to_vec(),
+        b"<< /Type /Annot /Subtype /Text /Rect [250 250 270 270] /IRT 6 0 R /Contents (OTHER-PAGE-REPLY) >>".to_vec(),
+        b"<< /Type /Annot /Subtype /Popup /Rect [200 150 290 190] /Parent 6 0 R >>".to_vec(),
+    ];
+    let mut doc = pdf(objs);
+    mark(&mut doc, 0, &[[10.0, 10.0, 70.0, 50.0]], "");
+    apply(&mut doc, None).unwrap();
+    let second = pdfcraft_model::pages(&doc).swap_remove(1);
+    assert!(annots_of(&doc, &second.dict).is_empty(), "the reply and the pop-up leave page 2");
+    let bytes = write_full(&doc, &SaveOptions { object_streams: false, ..SaveOptions::default() }).unwrap();
+    assert!(!bytes.windows(10).any(|w| w == b"PARENT-NOT"), "the removed comment survived the save");
+}
+
+#[test]
+fn a_redact_mark_written_in_place_is_refused() {
+    let objs: Vec<Vec<u8>> = vec![
+        b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 300] /Contents 4 0 R /Annots [<< /Type /Annot /Subtype /Redact /Rect [10 10 70 40] >>] >>"
+            .to_vec(),
+        stream("", b"BT ET"),
+    ];
+    let mut doc = pdf(objs);
+    mark(&mut doc, 0, &[[100.0, 100.0, 120.0, 120.0]], "");
+    assert!(matches!(apply(&mut doc, None), Err(RedactError::UnreadableMark(1))));
+}
+
+#[test]
+fn do_acts_on_the_operand_before_the_operator_like_the_renderer() {
+    // `/Missing /Im Do`: the renderer draws /Im, so redaction must find the image there.
+    let img = stream("/Type /XObject /Subtype /Image /Width 1 /Height 1 /ColorSpace /DeviceGray /BitsPerComponent 8", b"\x00");
+    let mut doc = one_page(b"q 100 0 0 100 10 10 cm /Missing /Im Do Q", "/XObject << /Im 7 0 R >>", vec![img]);
+    mark(&mut doc, 0, &[[0.0, 0.0, 300.0, 300.0]], "");
+    let r = apply(&mut doc, None).unwrap();
+    assert_eq!(r.images_removed, 1, "{r:?}");
+}
+
+#[test]
+fn hidden_text_removal_drops_the_source_text_of_added_content() {
+    let mut doc = one_page(b"BT /F1 12 Tf 3 Tr 20 20 Td (SECRET) Tj ET", "", vec![]);
+    let content_ref = pdfcraft_model::pages(&doc)[0].dict.get(b"Contents").and_then(Object::as_ref).unwrap();
+    doc.update_dict(content_ref, |d| {
+        d.set(b"PCAdded".to_vec(), Object::Dict(Dict::new()));
+    })
+    .unwrap();
+    sanitize::remove_hidden(&mut doc, &[sanitize::Hidden::HiddenText]).unwrap();
+    let p = &pdfcraft_model::pages(&doc)[0];
+    let (list, _) = page_streams(&doc, &p.dict, 0).unwrap();
+    assert!(list.iter().all(|o| doc.resolve(o).as_dict().is_some_and(|d| !d.contains(b"PCAdded"))));
+}
+
+#[test]
+fn a_reply_on_another_page_to_a_removed_popup_goes_too() {
+    let objs: Vec<Vec<u8>> = vec![
+        b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+        b"<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>".to_vec(),
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 300] /Contents 5 0 R /Annots [6 0 R 8 0 R] >>".to_vec(),
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 300] /Contents 5 0 R /Annots [7 0 R] >>".to_vec(),
+        stream("", b"BT ET"),
+        b"<< /Type /Annot /Subtype /Text /Rect [20 20 40 40] /Contents (PARENT-NOTE) /Popup 8 0 R >>".to_vec(),
+        b"<< /Type /Annot /Subtype /Text /Rect [250 250 270 270] /IRT 8 0 R /Contents (POPUP-REPLY) >>".to_vec(),
+        b"<< /Type /Annot /Subtype /Popup /Rect [200 150 290 190] /Parent 6 0 R /Contents (POPUP-TEXT) >>".to_vec(),
+    ];
+    let mut doc = pdf(objs);
+    mark(&mut doc, 0, &[[10.0, 10.0, 70.0, 50.0]], "");
+    apply(&mut doc, None).unwrap();
+    let second = pdfcraft_model::pages(&doc).swap_remove(1);
+    assert!(annots_of(&doc, &second.dict).is_empty());
+    let bytes = write_full(&doc, &SaveOptions { object_streams: false, ..SaveOptions::default() }).unwrap();
+    for gone in [&b"POPUP-REPLY"[..], b"POPUP-TEXT", b"PARENT-NOTE"] {
+        assert!(!bytes.windows(gone.len()).any(|w| w == gone), "{} survived", String::from_utf8_lossy(gone));
+    }
 }
