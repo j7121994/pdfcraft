@@ -284,10 +284,23 @@ pub(crate) fn renamed_sfnt(program: &[u8], name: &str) -> Option<Vec<u8>> {
     Some(out)
 }
 
+/// Where a record's string comes from: the old table's storage (offset and length), or the new
+/// name in UTF-16BE or in single bytes.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Text {
+    Old(u16, u16),
+    Wide,
+    Narrow,
+}
+
 /// A `name` table (format 0 or 1) with its identity records saying `name`. The records stay in
 /// their order, which the format requires to be sorted. An identity record in an encoding that
 /// can't spell `name`, or any record whose string lies outside the table, is left out; a broken
 /// language tag fails the table, because records refer to the tags by position.
+///
+/// Nothing is copied until the whole table has been read, and then each distinct string once:
+/// records that shared a string still share it, and the strings stay within what 16-bit offsets
+/// reach, so a small table can't make the copy large (#4098).
 fn renamed_table(table: &[u8], name: &str) -> Option<Vec<u8>> {
     let format = u16_at(table, 0)?;
     if format > 1 {
@@ -295,58 +308,81 @@ fn renamed_table(table: &[u8], name: &str) -> Option<Vec<u8>> {
     }
     let count = usize::from(u16_at(table, 2)?);
     let storage = usize::from(u16_at(table, 4)?);
-    let string = |length: u16, offset: u16| table.get(storage.checked_add(usize::from(offset))?..)?.get(..usize::from(length));
-    let mut records: Vec<([u16; 4], Vec<u8>)> = Vec::new();
+    let old = |offset: u16, length: u16| table.get(storage.checked_add(usize::from(offset))?..)?.get(..usize::from(length));
+    let tags_at = 6 + count * 12;
+    let tag_count = if format == 1 { usize::from(u16_at(table, tags_at)?) } else { 0 };
+    // The records and tags come before the strings, whose offset is 16 bits: a table that claims
+    // more of them overlaps its own strings and is refused.
+    u16::try_from(tags_at + if format == 1 { 2 + tag_count * 4 } else { 0 }).ok()?;
+    let mut records: Vec<([u16; 4], Text)> = Vec::with_capacity(count);
     for at in (0..count).map(|i| 6 + i * 12) {
         let field = |i: usize| u16_at(table, at + 2 * i);
         let key = [field(0)?, field(1)?, field(2)?, field(3)?];
         let [platform, encoding, _, id] = key;
-        let text = if IDENTITY.contains(&id) { spelled(name, platform, encoding) } else { string(field(4)?, field(5)?).map(<[u8]>::to_vec) };
+        let text = if IDENTITY.contains(&id) {
+            spelling(platform, encoding)
+        } else {
+            let (length, offset) = (field(4)?, field(5)?);
+            old(offset, length).map(|_| Text::Old(offset, length))
+        };
         if let Some(text) = text {
             records.push((key, text));
         }
     }
-    let mut tags = Vec::new();
-    if format == 1 {
-        let at = 6 + count * 12;
-        for i in 0..usize::from(u16_at(table, at)?) {
-            let field = |j: usize| u16_at(table, at + 2 + 4 * i + 2 * j);
-            tags.push(string(field(0)?, field(1)?)?.to_vec());
-        }
+    let mut tags = Vec::with_capacity(tag_count);
+    for at in (0..tag_count).map(|i| tags_at + 2 + 4 * i) {
+        let (length, offset) = (u16_at(table, at)?, u16_at(table, at + 2)?);
+        old(offset, length)?;
+        tags.push(Text::Old(offset, length));
     }
-    let tag_part = if format == 1 { 2 + tags.len() * 4 } else { 0 };
-    let mut out = Vec::new();
+    let wide: Vec<u8> = name.encode_utf16().flat_map(u16::to_be_bytes).collect();
+    let mut placed: BTreeMap<Text, [u16; 2]> = BTreeMap::new();
     let mut strings = Vec::new();
-    let mut push = |out: &mut Vec<u8>, text: &[u8]| -> Option<()> {
-        out.extend_from_slice(&u16::try_from(text.len()).ok()?.to_be_bytes());
-        out.extend_from_slice(&u16::try_from(strings.len()).ok()?.to_be_bytes());
-        strings.extend_from_slice(text);
-        Some(())
+    // A string's length and offset in the new storage, storing it the first time it is asked for.
+    let mut place = |text: Text| -> Option<[u16; 2]> {
+        if let Some(at) = placed.get(&text) {
+            return Some(*at);
+        }
+        let bytes = match text {
+            Text::Old(offset, length) => old(offset, length)?,
+            Text::Wide => &wide,
+            Text::Narrow => name.as_bytes(),
+        };
+        let at = [u16::try_from(bytes.len()).ok()?, u16::try_from(strings.len()).ok()?];
+        strings.extend_from_slice(bytes);
+        placed.insert(text, at);
+        Some(at)
     };
-    out.extend_from_slice(&format.to_be_bytes());
-    out.extend_from_slice(&u16::try_from(records.len()).ok()?.to_be_bytes());
-    out.extend_from_slice(&u16::try_from(6 + records.len() * 12 + tag_part).ok()?.to_be_bytes());
+    let header = 6 + records.len() * 12 + if format == 1 { 2 + tags.len() * 4 } else { 0 };
+    let mut out = Vec::with_capacity(header);
+    for v in [format, u16::try_from(records.len()).ok()?, u16::try_from(header).ok()?] {
+        out.extend_from_slice(&v.to_be_bytes());
+    }
     for (key, text) in &records {
-        key.iter().for_each(|k| out.extend_from_slice(&k.to_be_bytes()));
-        push(&mut out, text)?;
+        for v in key.iter().chain(&place(*text)?) {
+            out.extend_from_slice(&v.to_be_bytes());
+        }
     }
     if format == 1 {
         out.extend_from_slice(&u16::try_from(tags.len()).ok()?.to_be_bytes());
         for tag in &tags {
-            push(&mut out, tag)?;
+            for v in place(*tag)? {
+                out.extend_from_slice(&v.to_be_bytes());
+            }
         }
     }
     out.extend_from_slice(&strings);
     Some(out)
 }
 
-/// `name` (ASCII) as a `name` record in this platform and encoding: UTF-16BE for Unicode and the
-/// Windows Unicode and symbol encodings, bytes for Macintosh (every Mac script encoding starts
-/// with ASCII); `None` for the legacy Windows CJK encodings and the ISO and custom platforms.
-fn spelled(name: &str, platform: u16, encoding: u16) -> Option<Vec<u8>> {
+/// How `name` (ASCII) is written in a `name` record of this platform and encoding: UTF-16BE for
+/// Unicode and the Windows Unicode and symbol encodings, single bytes for Macintosh (every Mac
+/// script encoding starts with ASCII); `None` for the legacy Windows CJK encodings and the ISO and
+/// custom platforms.
+fn spelling(platform: u16, encoding: u16) -> Option<Text> {
     match (platform, encoding) {
-        (0, _) | (3, 0 | 1 | 10) => Some(name.encode_utf16().flat_map(u16::to_be_bytes).collect()),
-        (1, _) => Some(name.as_bytes().to_vec()),
+        (0, _) | (3, 0 | 1 | 10) => Some(Text::Wide),
+        (1, _) => Some(Text::Narrow),
         _ => None,
     }
 }

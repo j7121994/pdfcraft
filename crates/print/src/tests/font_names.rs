@@ -358,13 +358,61 @@ fn sfnt_with_name(format: u16, records: &[(u16, u16, u16, u16, &[u8])], tags: &[
         }
     }
     table.extend_from_slice(&strings);
+    sfnt_with_table(&table)
+}
+
+/// A minimal sfnt with `table` as its only table, `name`.
+fn sfnt_with_table(table: &[u8]) -> Vec<u8> {
     let mut sfnt = vec![0, 1, 0, 0, 0, 1, 0, 16, 0, 0, 0, 0];
     sfnt.extend_from_slice(b"name");
     sfnt.extend_from_slice(&0_u32.to_be_bytes());
     sfnt.extend_from_slice(&28_u32.to_be_bytes());
     sfnt.extend_from_slice(&(table.len() as u32).to_be_bytes());
-    sfnt.extend_from_slice(&table);
+    sfnt.extend_from_slice(table);
     sfnt
+}
+
+/// A format-0 `name` table whose `copies` copyright records all point at one `length`-byte
+/// string, then a family record after it; `storage` overrides where the table says its strings
+/// start.
+fn shared_string_table(copies: usize, length: usize, storage: Option<u16>) -> Vec<u8> {
+    let count = copies + 1;
+    let mut table = Vec::new();
+    for v in [0, count as u16, storage.unwrap_or((6 + count * 12) as u16)] {
+        table.extend_from_slice(&v.to_be_bytes());
+    }
+    let copyright = [3, 1, 0x409, 0, length as u16, 0];
+    for v in (0..copies).flat_map(|_| copyright).chain([3, 1, 0x409, 1, 2, length as u16]) {
+        table.extend_from_slice(&v.to_be_bytes());
+    }
+    table.extend(std::iter::repeat_n(b'c', length));
+    table.extend_from_slice(&[0, b'A']);
+    table
+}
+
+#[test]
+fn records_that_share_one_string_keep_sharing_it() {
+    // A thousand records over one 60,000-byte string. Each given its own copy they would take
+    // 60 MB and lie past what 16-bit offsets reach; stored once, the table is as small as before.
+    let table = shared_string_table(1024, 60_000, None);
+    let renamed = renamed_sfnt(&sfnt_with_table(&table), "PdfCraftPrint1").unwrap();
+    let font = FontRef::new(&renamed).unwrap();
+    let name = font.name().unwrap();
+    let copyright: std::collections::BTreeSet<_> =
+        name.name_record().iter().filter(|r| r.name_id().to_u16() == 0).map(|r| (r.string_offset().to_u32(), r.length())).collect();
+    assert_eq!(copyright.len(), 1, "every copyright record points at the one string");
+    assert!(font.table_data(skrifa::raw::types::Tag::new(b"name")).unwrap().len() <= table.len() + 64);
+    assert_eq!(name_of(&renamed, StringId::FAMILY_NAME).as_deref(), Some("PdfCraftPrint1"));
+    // 60,000 bytes of UTF-16BE: 30,000 characters.
+    assert_eq!(name_of(&renamed, StringId::COPYRIGHT_NOTICE).map(|c| c.chars().count()), Some(60_000 / 2));
+}
+
+#[test]
+fn a_name_table_claiming_more_records_than_fit_before_its_strings_is_refused() {
+    // The case reported on #4098: 65,535 records over one 65,535-byte string, the strings said to
+    // start inside the records. Copying each record's string before checking took about 4 GiB.
+    let table = shared_string_table(65_534, 65_535, Some(6));
+    assert_eq!(renamed_sfnt(&sfnt_with_table(&table), "X"), None);
 }
 
 /// A `name` record: platform, encoding, language, name ID and the string's bytes.
